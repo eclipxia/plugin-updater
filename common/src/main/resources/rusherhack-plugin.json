@@ -1,0 +1,13 @@
+{
+  "Plugin-Class": "dev.eclipxia.pluginupdater.PluginUpdaterPlugin",
+  "Name": "${project.plugin_name}",
+  "Version": "${project.plugin_version}",
+  "Description": "Downloads and auto-updates plugins from GitHub releases",
+  "URL": "https://github.com/eclipxia/plugin-updater",
+  "Authors": [
+    "eclipxia"
+  ],
+  "Minecraft-Versions": [
+    "${project.minecraft_version}"
+  ]
+}
