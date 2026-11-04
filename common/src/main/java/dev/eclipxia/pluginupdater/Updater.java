@@ -8,9 +8,11 @@ import org.rusherhack.client.api.RusherHackAPI;
 
 import java.io.InputStream;
 import java.net.URI;
+import java.net.URLDecoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -30,6 +32,11 @@ public class Updater {
 	
 	private final HttpClient http = HttpClient.newBuilder()
 			.followRedirects(HttpClient.Redirect.NORMAL)
+			.connectTimeout(Duration.ofSeconds(15))
+			.build();
+	
+	private final HttpClient noRedirectHttp = HttpClient.newBuilder()
+			.followRedirects(HttpClient.Redirect.NEVER)
 			.connectTimeout(Duration.ofSeconds(15))
 			.build();
 	
@@ -77,11 +84,19 @@ public class Updater {
 		}
 		
 		try {
+			final Path target = entry.fileName.isEmpty() ? null : pluginsDir().resolve(entry.fileName);
+			final boolean installed = !entry.installedTag.isEmpty() && target != null && Files.exists(target);
+			
+			//the web redirect is not rate limited, so only spend an API request when the tag changed
+			if(installed && entry.installedTag.equals(this.latestTagFromWeb(repo))) {
+				out.accept(repo + " is up to date (" + entry.installedTag + ")");
+				return false;
+			}
+			
 			final JsonObject release = this.fetchLatestRelease(repo);
 			final String tag = release.get("tag_name").getAsString();
 			
-			final Path target = entry.fileName.isEmpty() ? null : pluginsDir().resolve(entry.fileName);
-			if(tag.equals(entry.installedTag) && target != null && Files.exists(target)) {
+			if(tag.equals(entry.installedTag) && installed) {
 				out.accept(repo + " is up to date (" + tag + ")");
 				return false;
 			}
@@ -114,17 +129,46 @@ public class Updater {
 		}
 	}
 	
+	/**
+	 * github.com/owner/repo/releases/latest redirects to .../releases/tag/<tag>. That goes through the website,
+	 * not the API, so it does not use the rate limit. Returns null if it can't be determined (e.g. private repo).
+	 */
+	private String latestTagFromWeb(String repo) {
+		try {
+			final HttpResponse<Void> res = this.noRedirectHttp.send(
+					HttpRequest.newBuilder(URI.create("https://github.com/" + repo + "/releases/latest"))
+							.timeout(Duration.ofSeconds(30))
+							.header("User-Agent", "rusherhack-plugin-updater")
+							.GET().build(),
+					HttpResponse.BodyHandlers.discarding());
+			final String location = res.headers().firstValue("Location").orElse("");
+			final int i = location.indexOf("/releases/tag/");
+			return res.statusCode() / 100 == 3 && i >= 0 ? URLDecoder.decode(location.substring(i + "/releases/tag/".length()), StandardCharsets.UTF_8) : null;
+		} catch(Exception e) {
+			return null;
+		}
+	}
+	
 	private JsonObject fetchLatestRelease(String repo) throws Exception {
 		final HttpResponse<String> res = this.http.send(
 				this.request(URI.create("https://api.github.com/repos/" + repo + "/releases/latest"), "application/vnd.github+json"),
 				HttpResponse.BodyHandlers.ofString());
-		if(res.statusCode() == 404) {
-			throw new IllegalStateException("repo or release not found");
+		switch(res.statusCode()) {
+			case 200:
+				return JsonParser.parseString(res.body()).getAsJsonObject();
+			case 404:
+				throw new IllegalStateException("repo or release not found (private repos need a githubToken)");
+			case 403:
+			case 429:
+				if("0".equals(res.headers().firstValue("X-RateLimit-Remaining").orElse(""))) {
+					final long reset = res.headers().firstValue("X-RateLimit-Reset").map(Long::parseLong).orElse(0L);
+					final long minutes = Math.max(1, (reset - System.currentTimeMillis() / 1000 + 59) / 60);
+					throw new IllegalStateException("GitHub rate limit reached, try again in " + minutes + " min (a githubToken in plugin-updater.json raises the limit)");
+				}
+				throw new IllegalStateException("GitHub refused the request (HTTP " + res.statusCode() + ")");
+			default:
+				throw new IllegalStateException("GitHub returned HTTP " + res.statusCode());
 		}
-		if(res.statusCode() != 200) {
-			throw new IllegalStateException("GitHub returned HTTP " + res.statusCode());
-		}
-		return JsonParser.parseString(res.body()).getAsJsonObject();
 	}
 	
 	/**
@@ -158,9 +202,10 @@ public class Updater {
 		Files.createDirectories(dest.getParent());
 		final Path part = dest.resolveSibling(dest.getFileName() + ".part");
 		
-		//the API url with octet-stream works for both public and private repos
+		//public repos: the plain download url is not rate limited. With a token use the API url so private repos work
+		final String url = this.config.githubToken.isBlank() ? asset.get("browser_download_url").getAsString() : asset.get("url").getAsString();
 		final HttpResponse<InputStream> res = this.http.send(
-				this.request(URI.create(asset.get("url").getAsString()), "application/octet-stream"),
+				this.request(URI.create(url), "application/octet-stream"),
 				HttpResponse.BodyHandlers.ofInputStream());
 		try(InputStream in = res.body()) {
 			if(res.statusCode() != 200) {
